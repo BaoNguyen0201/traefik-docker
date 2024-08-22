@@ -1,0 +1,45 @@
+version: "3.7"
+
+services:
+  service-a:
+    image: traefik/whoami
+    labels:
+      - "traefik.enable=true"
+      # https
+      - "traefik.http.routers.service-a.rule=Host(`whoami.nmb.id.vn`)"
+      - "traefik.http.routers.service-a.tls=true"
+      - "traefik.http.routers.service-a.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.service-a.entrypoints=websecure"
+        # http (redirect to https)
+      - "traefik.http.routers.service-a-http.rule=Host(`whoami.nmb.id.vn`)"
+      - "traefik.http.routers.service-a-http.entrypoints=web"
+      - "traefik.http.routers.service-a-http.middlewares=redirect-to-https@file"
+    networks:
+      - traefik_default
+  service-b:
+    image: bao:healthv2
+    labels:
+      - "traefik.enable=true"
+      # https
+      - "traefik.http.routers.service-b.rule=Host(`app.nmb.id.vn`)"
+      - "traefik.http.routers.service-b.tls=true"
+      - "traefik.http.routers.service-b.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.service-b.entrypoints=websecure"
+    networks:
+      - traefik_default
+  service-c:
+    image: nginx
+    labels:
+      - "traefik.enable=true"
+      # https
+      - "traefik.http.routers.service-c.rule=Host(`nginx.nmb.id.vn`)"
+      - "traefik.http.routers.service-c.tls=true"
+      - "traefik.http.routers.service-c.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.service-c.entrypoints=websecure"
+    networks:
+      - traefik_default
+
+networks:
+  traefik_default:
+    external: true
+

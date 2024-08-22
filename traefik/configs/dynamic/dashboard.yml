@@ -1,0 +1,31 @@
+http:
+  routers:
+    traefik:
+      rule: Host(`traefik.nmb.id.vn`)
+      entryPoints:
+        - websecure
+      service: api@internal
+      middlewares:
+        - dashboardauth
+      tls:
+        certResolver: letsencrypt
+
+    traefik-http-redirect:
+      rule: Host(`traefik.nmb.id.vn`)
+      entryPoints:
+        - web
+      service: api@internal
+      middlewares:
+        - "redirect-to-https"
+        - "dashboardauth"
+
+  middlewares:
+    dashboardauth:
+      basicAuth:
+        users:
+          - "admin:$apr1$wyljm18q$7wwRiPNSeA0VKDdN3DiYl/"
+
+    redirect-to-https:
+      redirectScheme:
+        scheme: https
+
