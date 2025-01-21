@@ -1,0 +1,221 @@
+#!/bin/sh
+set -e
+
+# Defaults
+HEALTHCHECK_TIMEOUT=60
+NO_HEALTHCHECK_TIMEOUT=10
+WAIT_AFTER_HEALTHY_DELAY=0
+
+# Print metadata for Docker CLI plugin
+if [ "$1" = "docker-cli-plugin-metadata" ]; then
+  cat <<EOF
+{
+  "SchemaVersion": "0.0.1",
+  "Vendor": "Panther Nguyen",
+  "Version": "v1",
+  "ShortDescription": "Rollout new Compose service version"
+}
+EOF
+  exit
+fi
+
+# Save docker arguments, i.e. arguments before "rollout"
+while [ $# -gt 0 ]; do
+  if [ "$1" = "rollout" ]; then
+    shift
+    break
+  fi
+
+  DOCKER_ARGS="$DOCKER_ARGS $1"
+  shift
+done
+
+# Check if compose v2 is available
+if docker compose >/dev/null 2>&1; then
+  # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
+  COMPOSE_COMMAND="docker $DOCKER_ARGS compose"
+elif docker-compose >/dev/null 2>&1; then
+  COMPOSE_COMMAND="docker-compose"
+else
+  echo "docker compose or docker-compose is required"
+  exit 1
+fi
+
+usage() {
+  cat <<EOF
+
+Usage: docker rollout [OPTIONS] SERVICE
+
+Rollout new Compose service version.
+
+Options:
+  -h, --help                  Print usage
+  -f, --file FILE             Compose configuration files
+  -t, --timeout N             Healthcheck timeout (default: $HEALTHCHECK_TIMEOUT seconds)
+  -w, --wait N                When no healthcheck is defined, wait for N seconds
+                              before stopping old container (default: $NO_HEALTHCHECK_TIMEOUT seconds)
+      --wait-after-healthy N  When healthcheck is defined and succeeds, wait for additional N seconds
+                              before stopping the old container (default: 0 seconds)
+      --env-file FILE         Specify an alternate environment file
+
+EOF
+}
+
+exit_with_usage() {
+  usage
+  exit 1
+}
+cleanup_stopped_containers() {
+  echo "==> Removing stopped containers for service '$SERVICE' from previous pipeline runs"
+
+  # Get IDs of all stopped containers for the service
+  STOPPED_CONTAINER_IDS=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --filter "status=exited" --quiet "$SERVICE")
+
+  if [ -n "$STOPPED_CONTAINER_IDS" ]; then
+    echo "==> Found stopped containers: $STOPPED_CONTAINER_IDS"
+    docker $DOCKER_ARGS rm $STOPPED_CONTAINER_IDS
+  else
+    echo "==> No stopped containers to remove."
+  fi
+}
+
+
+healthcheck() {
+  # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
+  docker $DOCKER_ARGS inspect --format='{{json .State.Health.Status}}' "$1" | grep -v "unhealthy" | grep -q "healthy"
+}
+
+scale() {
+  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+  $COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES up --detach --scale "$1=$2" --no-recreate "$1"
+}
+
+main() {
+  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+  if [ -z "$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE")" ]; then
+    echo "==> Service '$SERVICE' is not running. Starting the service."
+    $COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES up --detach --no-recreate "$SERVICE"
+    exit 0
+  fi
+
+  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+  cleanup_stopped_containers
+  OLD_CONTAINER_IDS_STRING=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE" | tr '\n' '|' | sed 's/|$//')
+  OLD_CONTAINER_IDS=$(echo "$OLD_CONTAINER_IDS_STRING" | tr '|' ' ')
+  echo "$OLD_CONTAINER_IDS" > old_container_ids.txt
+  SCALE=$(echo "$OLD_CONTAINER_IDS" | wc -w | tr -d ' ')
+  SCALE_TIMES_TWO=$((SCALE * 2))
+  echo "==> Scaling '$SERVICE' to '$SCALE_TIMES_TWO' instances"
+  scale "$SERVICE" $SCALE_TIMES_TWO
+
+  # Create a variable that contains the IDs of the new containers, but not the old ones
+  # shellcheck disable=SC2086 # COMPOSE_FILES and ENV_FILES must be unquoted to allow multiple files
+  NEW_CONTAINER_IDS=$($COMPOSE_COMMAND $COMPOSE_FILES $ENV_FILES ps --quiet "$SERVICE" | grep -Ev "$OLD_CONTAINER_IDS_STRING" | tr '\n' ' ')
+  echo "$NEW_CONTAINER_IDS" > new_container_ids.txt
+
+  # Check if first container has healthcheck
+  # shellcheck disable=SC2086 # DOCKER_ARGS must be unquoted to allow multiple arguments
+  if docker $DOCKER_ARGS inspect --format='{{json .State.Health}}' "$(echo $OLD_CONTAINER_IDS | cut -d\  -f 1)" | grep -q "Status"; then
+    echo "==> Waiting for new containers to be healthy (timeout: $HEALTHCHECK_TIMEOUT seconds)"
+    for _ in $(seq 1 "$HEALTHCHECK_TIMEOUT"); do
+      SUCCESS=0
+
+      for NEW_CONTAINER_ID in $NEW_CONTAINER_IDS; do
+        if healthcheck "$NEW_CONTAINER_ID"; then
+          SUCCESS=$((SUCCESS + 1))
+        fi
+      done
+
+      if [ "$SUCCESS" = "$SCALE" ]; then
+        break
+      fi
+
+      sleep 1
+    done
+
+    SUCCESS=0
+
+    for NEW_CONTAINER_ID in $NEW_CONTAINER_IDS; do
+      if healthcheck "$NEW_CONTAINER_ID"; then
+        SUCCESS=$((SUCCESS + 1))
+      fi
+    done
+
+    if [ "$SUCCESS" != "$SCALE" ]; then
+      echo "==> New containers are not healthy. Rolling back." >&2
+
+      docker $DOCKER_ARGS stop $NEW_CONTAINER_IDS
+      docker $DOCKER_ARGS rm $NEW_CONTAINER_IDS
+
+      exit 1
+    fi
+    
+    if [ "$WAIT_AFTER_HEALTHY_DELAY" != "0" ]; then
+      echo "==> Waiting for healthy containers to settle down ($WAIT_AFTER_HEALTHY_DELAY seconds)"
+      sleep $WAIT_AFTER_HEALTHY_DELAY
+    fi
+  else
+    echo "==> Waiting for new containers to be ready ($NO_HEALTHCHECK_TIMEOUT seconds)"
+    sleep "$NO_HEALTHCHECK_TIMEOUT"
+  fi
+
+  echo "==> Stopping old containers and retaining for rollback"
+
+  # shellcheck disable=SC2086 # DOCKER_ARGS and OLD_CONTAINER_IDS must be unquoted to allow multiple arguments
+  docker $DOCKER_ARGS stop $OLD_CONTAINER_IDS
+  # shellcheck disable=SC2086 # DOCKER_ARGS and OLD_CONTAINER_IDS must be unquoted to allow multiple arguments
+  #docker $DOCKER_ARGS rm $OLD_CONTAINER_IDS
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  -f | --file)
+    COMPOSE_FILES="$COMPOSE_FILES -f $2"
+    shift 2
+    ;;
+  --env-file)
+    ENV_FILES="$ENV_FILES --env-file $2"
+    shift 2
+    ;;
+  -t | --timeout)
+    HEALTHCHECK_TIMEOUT="$2"
+    shift 2
+    ;;
+  -w | --wait)
+    NO_HEALTHCHECK_TIMEOUT="$2"
+    shift 2
+    ;;
+  --wait-after-healthy)
+    WAIT_AFTER_HEALTHY_DELAY="$2"
+    shift 2
+    ;;
+  -*)
+    echo "Unknown option: $1"
+    exit_with_usage
+    ;;
+  *)
+    if [ -n "$SERVICE" ]; then
+      echo "SERVICE is already set to '$SERVICE'"
+
+      if [ "$SERVICE" != "$1" ]; then
+        exit_with_usage
+      fi
+    fi
+
+    SERVICE="$1"
+    shift
+    ;;
+  esac
+done
+
+# Require SERVICE argument
+if [ -z "$SERVICE" ]; then
+  echo "SERVICE is missing"
+  exit_with_usage
+fi
+
+main
